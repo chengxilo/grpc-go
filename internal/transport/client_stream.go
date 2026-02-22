@@ -19,13 +19,31 @@
 package transport
 
 import (
+	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
+)
+
+// NonGRPCBodyMaxLen is the maximum size of nonGRPCBodyBuf.
+const NonGRPCBodyMaxLen = 1024
+
+// nonGRPCBodyCollectionTimeout is the timeout for collecting non-gRPC body.
+const nonGRPCBodyCollectionTimeout = 3 * time.Second
+
+// nonGRPCBodyCollectState indicate the stage of collecting non-gRPC body.
+type nonGRPCBodyCollectState int
+
+const (
+	none nonGRPCBodyCollectState = iota
+	collecting
+	stopped
 )
 
 // ClientStream implements streaming functionality for a gRPC client.
@@ -46,12 +64,75 @@ type ClientStream struct {
 	// headerValid indicates whether a valid header was received.  Only
 	// meaningful after headerChan is closed (always call waitOnHeader() before
 	// reading its value).
-	headerValid      bool
+	headerValid bool
+
+	collectMu sync.Mutex
+	// nonGRPCStatus is used to store the status error when non-gRPC response is received.
+	nonGRPCStatus *status.Status
+	// collectState indicates if the stream is in a mode to capture non-gRPC error details.
+	// Allowing subsequent DATA frames to be stored as error message.
+	collectState   nonGRPCBodyCollectState
+	nonGRPCBodyBuf []byte      // nonGRPCBodyBuf stores the body of a non-gRPC response body.
+	collectTimer   *time.Timer // collectTimer is used to limit the time spent on collecting non-gRPC error details.
+
 	noHeaders        bool          // set if the client never received headers (set only after the stream is done).
 	headerChanClosed uint32        // set when headerChan is closed. Used to avoid closing headerChan multiple times.
 	bytesReceived    atomic.Bool   // indicates whether any bytes have been received on this stream
 	unprocessed      atomic.Bool   // set if the server sends a refused stream or GOAWAY including this stream
 	statsHandler     stats.Handler // nil for internal streams (e.g., health check, ORCA) where telemetry is not supported.
+}
+
+func (s *ClientStream) startNonGRPCBodyCollection(st *status.Status, onTimeout func()) {
+	s.collectMu.Lock()
+	defer s.collectMu.Unlock()
+	if s.collectState != none {
+		return
+	}
+	s.nonGRPCStatus = st
+	s.collectState = collecting
+	s.nonGRPCBodyBuf = make([]byte, 0, NonGRPCBodyMaxLen)
+	s.collectTimer = time.AfterFunc(nonGRPCBodyCollectionTimeout, onTimeout)
+}
+
+func (s *ClientStream) tryCollectNonGRPCBody(f *parsedDataFrame) (handle bool, end bool) {
+	s.collectMu.Lock()
+	defer s.collectMu.Unlock()
+	switch s.collectState {
+	case none:
+		return false, false
+	case stopped:
+		return true, true
+	case collecting:
+		// Continue to collect data.
+	}
+
+	n := min(f.data.Len(), NonGRPCBodyMaxLen-len(s.nonGRPCBodyBuf))
+	s.nonGRPCBodyBuf = append(s.nonGRPCBodyBuf, f.data.ReadOnlyData()[0:n]...)
+	if len(s.nonGRPCBodyBuf) >= NonGRPCBodyMaxLen || f.StreamEnded() {
+		// Stop collecting data when the buffer is full or the stream ends.
+		s.stopNonGRPCBodyCollectionLocked()
+		return true, true
+	}
+	return true, false
+}
+
+func (s *ClientStream) stopNonGRPCBodyCollection() {
+	s.collectMu.Lock()
+	defer s.collectMu.Unlock()
+	s.stopNonGRPCBodyCollectionLocked()
+}
+
+func (s *ClientStream) stopNonGRPCBodyCollectionLocked() {
+	if s.collectState == stopped {
+		return
+	}
+	s.collectState = stopped
+	if s.collectTimer != nil {
+		s.collectTimer.Stop()
+		s.collectTimer = nil
+	}
+	data := "\nDATA-----------------------------\n" + strings.ToValidUTF8(string(s.nonGRPCBodyBuf), "�")
+	s.nonGRPCStatus = status.New(s.nonGRPCStatus.Code(), s.nonGRPCStatus.Message()+data)
 }
 
 // Read reads an n byte message from the input stream.

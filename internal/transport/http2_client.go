@@ -934,6 +934,10 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr, handler s
 	return s, nil
 }
 
+func (t *http2Client) closeStreamWithNonGRPCStatus(s *ClientStream) {
+	t.closeStream(s, nil, true, http2.ErrCodeProtocol, nil, nil, true)
+}
+
 func (t *http2Client) closeStream(s *ClientStream, err error, rst bool, rstCode http2.ErrCode, st *status.Status, mdata map[string][]string, eosReceived bool) {
 	// Set stream status to done.
 	if s.swapState(streamDone) == streamDone {
@@ -942,6 +946,14 @@ func (t *http2Client) closeStream(s *ClientStream, err error, rst bool, rstCode 
 		<-s.done
 		return
 	}
+	s.collectMu.Lock()
+	cs := s.nonGRPCStatus
+	s.collectMu.Unlock()
+	if cs != nil {
+		st = cs
+		err = st.Err()
+	}
+
 	// status and trailers can be updated here without any synchronization because the stream goroutine will
 	// only read it after it sees an io.EOF error from read or write and we'll write those errors
 	// only after updating this.
@@ -1222,6 +1234,18 @@ func (t *http2Client) handleData(f *parsedDataFrame) {
 			t.closeStream(s, io.EOF, true, http2.ErrCodeFlowControl, status.New(codes.Internal, err.Error()), nil, false)
 			return
 		}
+
+		handle, end := s.tryCollectNonGRPCBody(f)
+		if handle {
+			if w := s.fc.onRead(size); w > 0 {
+				t.controlBuf.put(&outgoingWindowUpdate{s.id, w})
+			}
+			if end {
+				t.closeStreamWithNonGRPCStatus(s)
+			}
+			return
+		}
+
 		dataLen := f.data.Len()
 		if f.Header().Flags.Has(http2.FlagDataPadded) {
 			if w := s.fc.onRead(size - uint32(dataLen)); w > 0 {
@@ -1561,8 +1585,20 @@ func (t *http2Client) operateHeaders(frame *http2.MetaHeadersFrame) {
 			errs = append(errs, contentTypeErr)
 		}
 
-		se := status.New(grpcErrorCode, strings.Join(errs, "; "))
-		t.closeStream(s, se.Err(), true, http2.ErrCodeProtocol, se, nil, endStream)
+		errMsg := strings.Join(errs, "; ")
+		se := status.New(grpcErrorCode, errMsg)
+		if endStream {
+			t.closeStream(s, se.Err(), true, http2.ErrCodeProtocol, se, nil, true)
+			return
+		}
+
+		s.startNonGRPCBodyCollection(se, func() {
+			s.stopNonGRPCBodyCollection()
+			t.closeStreamWithNonGRPCStatus(s)
+		})
+		if atomic.CompareAndSwapUint32(&s.headerChanClosed, 0, 1) {
+			close(s.headerChan)
+		}
 		return
 	}
 
