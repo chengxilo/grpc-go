@@ -37,7 +37,7 @@ const NonGRPCBodyMaxLen = 1024
 // nonGRPCBodyCollectionTimeout is the timeout for collecting non-gRPC body.
 const nonGRPCBodyCollectionTimeout = 3 * time.Second
 
-// nonGRPCBodyCollectState indicate the stage of collecting non-gRPC body.
+// nonGRPCBodyCollectState indicates the stage of collecting non-gRPC body.
 type nonGRPCBodyCollectState int
 
 const (
@@ -72,7 +72,7 @@ type ClientStream struct {
 	// collectState indicates if the stream is in a mode to capture non-gRPC error details.
 	// Allowing subsequent DATA frames to be stored as error message.
 	collectState   nonGRPCBodyCollectState
-	nonGRPCBodyBuf []byte      // nonGRPCBodyBuf stores the body of a non-gRPC response body.
+	nonGRPCBodyBuf []byte      // nonGRPCBodyBuf stores the body of a non-gRPC response.
 	collectTimer   *time.Timer // collectTimer is used to limit the time spent on collecting non-gRPC error details.
 
 	noHeaders        bool          // set if the client never received headers (set only after the stream is done).
